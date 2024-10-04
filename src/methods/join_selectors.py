@@ -1,26 +1,58 @@
 import datetime as dt
 import random
+import warnings
 from collections import deque
 from itertools import islice
+from typing import Tuple, Union
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import polars.selectors as cs
 from catboost import CatBoostClassifier, CatBoostRegressor
+from pytabkit.models.sklearn.sklearn_interfaces import (
+    RealMLP_TD_Classifier,
+    RealMLP_TD_Regressor,
+    Resnet_RTDL_D_Classifier,
+    Resnet_RTDL_D_Regressor,
+)
 from sklearn.base import BaseEstimator
+from sklearn.compose import (
+    ColumnTransformer,
+    make_column_selector,
+    make_column_transformer,
+)
+from sklearn.ensemble import (  # HistGradientBoostingClassifier,; HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, SGDClassifier
 from sklearn.metrics import f1_score, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import ShuffleSplit, train_test_split
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    OrdinalEncoder,
+    StandardScaler,
+    TargetEncoder,
+)
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from skrub import GapEncoder, MinHashEncoder, TableVectorizer, tabular_learner
 from tqdm import tqdm
 
 import src.utils.joining as ju
 from src.data_structures.loggers import ScenarioLogger
 from src.data_structures.metadata import CandidateJoin
+from src.utils.constants import SUPPORTED_MODELS
+
+warnings.filterwarnings("ignore")
+
 
 SUPPORTED_BUDGET_TYPES = ["iterations"]
 SUPPORTED_RANKING_METHODS = ["containment"]
+
+CACHE_PATH = "results/cache"
 
 # For reproducibility
 CATBOOST_RANDOM_SEED = 42
@@ -29,6 +61,26 @@ CATBOOST_RANDOM_SEED = 42
 def measure_containment(
     source_table: pl.DataFrame, cand_table: pl.DataFrame, left_on: list, right_on: list
 ):
+    """This function measures the exact Jaccard containment of the query column
+    `left_on` in `source_table` in column `right_on` in table `cand_table`.
+
+    Containment is defined as JC(Q,X) = |Q intersection X| / |Q|
+
+    Args:
+        source_table (pl.DataFrame): Source table.
+        cand_table (pl.DataFrame): Candidate table to query on.
+        left_on (list): Query column.
+        right_on (list): Candidate column
+
+    Returns:
+        float: Containment value.
+
+    Raises:
+        NotImplmentedError if more than one column is provided.
+    """
+    if len(left_on) > 1 or len(right_on) > 1:
+        raise NotImplementedError("Only single query columns are supported")
+
     unique_source = source_table[left_on].unique()
     unique_cand = cand_table[right_on].unique()
 
@@ -38,6 +90,16 @@ def measure_containment(
 
 
 def build_containment_ranking(X: pd.DataFrame, candidate_joins: dict):
+    """Given a table X and a list of candidates in any ranking, re-rank everything
+    based on Jaccard containment.
+
+    Args:
+        X (pd.DataFrame): The base table to evaluate the containment on.
+        candidate_joins (dict): All the candidate join objects to be ranked.
+
+    Returns:
+        pl.DataFrame: The candidate ranking.
+    """
     containment_list = []
     for hash_, mdata in tqdm(
         candidate_joins.items(),
@@ -66,20 +128,74 @@ def build_containment_ranking(X: pd.DataFrame, candidate_joins: dict):
     return ranking_df
 
 
-class BaseJoinEstimator(BaseEstimator):
-    """BaseJoinEstimator class. This class is extended by the other estimators.
-    Note that, despite it being called `BaseJoinEstimator`, this class is used as base for the NoJoin estimator as well.
+def _split_X_y(X, y, test_size=0.2):
+    # I want the indices for the
+    s = ShuffleSplit(test_size=test_size)
+    train_idx, valid_idx = next(s.split(X, y))
+
+    return train_idx, valid_idx
+
+
+def _build_preprocessor(target_type="regressor"):
+    num_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="mean", keep_empty_features=True)),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    cat_transformer = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="most_frequent", keep_empty_features=True),
+            ),
+            # ("target_encoder", TargetEncoder(target_type=target_type, smooth=5000.0)),
+            (
+                "ordinal_encoder",
+                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+            ),
+            # ("onehot_encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", num_transformer, make_column_selector(dtype_include=np.number)),
+            ("cat", cat_transformer, make_column_selector(dtype_include=object)),
+        ],
+        remainder="passthrough",
+    )
+
+    return preprocessor
+
+
+def _reorder_indices_for_validation(X_train, X_valid, y_train, y_valid):
+    # Concatenate the two splits for fitting
+    X_concat = np.concatenate([X_train, X_valid])
+    y_concat = np.concatenate([y_train.to_numpy(), y_valid.to_numpy()])
+
+    # Prepare the indices for fitting
+    n_train = len(X_train)
+    n_val = len(X_valid)
+
+    train_idx = np.arange(0, n_train)
+    valid_idx = np.arange(n_train, n_train + n_val)
+    return (X_concat, y_concat, train_idx, valid_idx)
+
+
+class BaseJoinSelector(BaseEstimator):
+    """BaseJoinSelector class. This class is extended by the other estimators.
+    Note that, despite it being called `BaseJoinSelector`, this class is used as base for the NoJoin estimator as well.
     """
 
     def __init__(
         self,
         scenario_logger: ScenarioLogger,
-        target_column: str = None,
-        model_parameters: dict = None,
+        target_column: str | None = None,
+        model_parameters: dict | None = None,
         task: str = "regression",
     ) -> None:
-        """Base JoinEstimator class. This class is supposed to be extended by the
-        other estimators. It uses the `fit`/`predict` paradigm to implement the
+        """Base Selector class. This class is supposed to be extended by the
+        other selectors. It uses the `fit`/`predict` paradigm to implement the
         evaluation of a join suggestion method.
 
         Args:
@@ -96,12 +212,16 @@ class BaseJoinEstimator(BaseEstimator):
         """
         super().__init__()
 
-        if task not in ["regression", "classification"]:
+        if task == "regression":
+            self.target_type = "continuous"
+        elif task == "classification":
+            self.target_type = "binary"
+        else:
             raise ValueError(f"Task {task} not supported.")
 
         self.chosen_model = model_parameters["chosen_model"]
 
-        if self.chosen_model not in ["catboost", "linear"]:
+        if self.chosen_model not in SUPPORTED_MODELS:
             raise ValueError(f"Model {self.chosen_model} not supported.")
 
         self.name = "base_estimator"
@@ -120,13 +240,13 @@ class BaseJoinEstimator(BaseEstimator):
 
         self.model = None
         self.cat_features = None
+
+        self.preprocessor = _build_preprocessor(self.target_type)
+
         if self.chosen_model == "linear":
             self.with_validation = False
-            self.cat_encoder = None
-        else:
-            self.cat_encoder = None
 
-    def build_model(self, X=None):
+    def build_model(self, X: pd.DataFrame | None = None):
         """Build the model using the parameters supplied during __init__.
         Note that multiple models may be created by a JoinEstimator during training.
 
@@ -145,6 +265,10 @@ class BaseJoinEstimator(BaseEstimator):
             self.build_catboost(cat_features)
         elif self.chosen_model == "linear":
             self.build_linear()
+        elif self.chosen_model == "resnet":
+            self.build_resnet()
+        elif self.chosen_model == "realmlp":
+            self.build_realmlp()
         else:
             raise ValueError(f"Chosen model {self.model} is not recognized.")
 
@@ -162,7 +286,7 @@ class BaseJoinEstimator(BaseEstimator):
             "l2_leaf_reg": 0.01,
             "od_type": "Iter",
             "od_wait": 10,
-            "iterations": 100,
+            "iterations": 300,
             "verbose": 0,
         }
 
@@ -187,11 +311,35 @@ class BaseJoinEstimator(BaseEstimator):
             ValueError: Raise ValueError if the value in `self.task` is not a
             valid task (`regression` or `classification`).
         """
-        self.cat_encoder = OneHotEncoder(handle_unknown="ignore")
         if self.task == "regression":
             self.model = LinearRegression()
         elif self.task == "classification":
             self.model = SGDClassifier()
+        else:
+            raise ValueError
+
+    def build_realmlp(self):
+        """Build an estimator based on RealMLP."""
+        defaults = {
+            "n_threads": 32,
+        }
+
+        parameters = dict(defaults)
+        parameters.update(self.model_parameters)
+
+        if self.task == "regression":
+            self.model = RealMLP_TD_Regressor(**parameters)
+        elif self.task == "classification":
+            self.model = RealMLP_TD_Classifier(**parameters)
+        else:
+            raise ValueError
+
+    def build_resnet(self):
+        """Build an estimator based on ResNet."""
+        if self.task == "regression":
+            self.model = Resnet_RTDL_D_Regressor(n_threads=32)
+        elif self.task == "classification":
+            self.model = Resnet_RTDL_D_Classifier(n_threads=32)
         else:
             raise ValueError
 
@@ -219,9 +367,6 @@ class BaseJoinEstimator(BaseEstimator):
         """
         raise NotImplementedError
 
-    def transform(self, X):
-        raise NotImplementedError
-
     def get_cat_features(self, X: pl.DataFrame | pd.DataFrame) -> list:
         """Given an input table X, return the list of features that are considered
         to be categorical by the appropriate type selection function.
@@ -245,36 +390,57 @@ class BaseJoinEstimator(BaseEstimator):
         return cat_features
 
     def fit_model(
-        self, X_train, y_train, X_valid=None, y_valid=None, skip_validation=False
+        self,
+        X,
+        y,
+        validation_set: tuple | None = None,
     ):
-        if self.chosen_model == "linear":
-            assert isinstance(self.model, (LinearRegression, SGDClassifier))
-            X_train = self.prepare_table(X_train)
-            self.cat_encoder.fit(X_train)
-            X_enc = self.cat_encoder.transform(X_train)
-            self.model.fit(X=X_enc, y=y_train)
-        elif self.chosen_model == "catboost":
-            assert isinstance(self.model, (CatBoostRegressor, CatBoostClassifier))
-            X_train = self.prepare_table(X_train)
-
-            if self.with_validation and not skip_validation:
-                X_valid = self.prepare_table(X_valid)
+        if validation_set is not None:
+            X_train, y_train = X, y
+            X_valid, y_valid = validation_set
+            if self.chosen_model == "catboost":
+                X_train = (self.prepare_table(X_train)).to_pandas()
+                X_valid = (self.prepare_table(X_valid)).to_pandas()
+                y_train, y_valid = y_train.to_pandas(), y_valid.to_pandas()
                 self.model.fit(X=X_train, y=y_train, eval_set=(X_valid, y_valid))
-            else:
-                self.model.fit(X=X_train, y=y_train)
+            elif self.chosen_model in ["resnet", "realmlp"]:
+                X_train, _ = self.prepare_table_preprocessing(X_train)
+                self.preprocessor.fit(X_train, y_train)
+                X_train_enc = self.preprocessor.transform(X_train)
+                X_valid, _ = self.prepare_table_preprocessing(X_valid)
+                X_valid_enc = self.preprocessor.transform(X_valid)
+
+                (
+                    X_concat,
+                    y_concat,
+                    _train_idx,
+                    _valid_idx,
+                ) = _reorder_indices_for_validation(
+                    X_train_enc, X_valid_enc, y_train, y_valid
+                )
+
+                self.model.fit(
+                    X=X_concat,
+                    y=y_concat,
+                    val_idxs=_valid_idx,
+                )
         else:
-            raise ValueError
+            # No validation set, keep all passed samples as train
+            X_train, y_train = X, y
+            # Linear
+            X_train, _ = self.prepare_table_preprocessing(X_train)
+            self.preprocessor.fit(X_train, y_train)
+            X_train_enc = self.preprocessor.transform(X_train)
+            self.model.fit(X=X_train_enc, y=y_train)
 
     def predict_model(self, X):
-        if self.chosen_model == "linear":
-            X = self.prepare_table(X)
-            X_enc = self.cat_encoder.transform(X)
-            y_pred = self.model.predict(X_enc)
-        elif self.chosen_model == "catboost":
-            X = self.prepare_table(X)
+        if self.chosen_model == "catboost":
+            X = (self.prepare_table(X)).to_pandas()
             y_pred = self.model.predict(X)
         else:
-            raise ValueError
+            X, _ = self.prepare_table_preprocessing(X)
+            X_enc = self.preprocessor.transform(X)
+            y_pred = self.model.predict(X_enc)
         return y_pred
 
     def get_estimator_parameters(self):
@@ -283,15 +449,71 @@ class BaseJoinEstimator(BaseEstimator):
     def get_additional_info(self):
         raise NotImplementedError
 
-    def retrain_cat_encoder(self):
-        self.cat_encoder = OneHotEncoder(handle_unknown="ignore")
+    def _prepare_inner_model(self):
 
-    def fit_cat_encoder(self, table):
-        if self.chosen_model == "linear":
-            self.cat_encoder = OneHotEncoder(handle_unknown="ignore")
-            self.cat_encoder.fit(table)
+        if self.task == "regression":
+            inner_model = make_pipeline(
+                TableVectorizer(
+                    high_cardinality=MinHashEncoder(),
+                    low_cardinality=OrdinalEncoder(
+                        handle_unknown="use_encoded_value", unknown_value=np.nan
+                    ),
+                    n_jobs=1,
+                ),
+                RandomForestRegressor(n_jobs=1),
+                memory=CACHE_PATH,
+            )
         else:
-            return None
+            inner_model = make_pipeline(
+                TableVectorizer(
+                    high_cardinality=MinHashEncoder(),
+                    low_cardinality=OrdinalEncoder(
+                        handle_unknown="use_encoded_value", unknown_value=np.nan
+                    ),
+                    n_jobs=32,
+                ),
+                RandomForestClassifier(n_jobs=32),
+                memory=CACHE_PATH,
+            )
+        return inner_model
+
+    def _fit_predict_inner_model(self, X_train, X_valid, y, inner_model):
+        # if isinstance(X_train, pl.DataFrame):
+        #     X_train = X_train.to_pandas()
+
+        # if isinstance(X_valid, pl.DataFrame):
+        #     X_valid = X_valid.to_pandas()
+
+        inner_model.fit(X_train, y)
+        self._end_time("model_train")
+        self._start_time("prepare")
+
+        return inner_model.predict(X_valid)
+
+    def _fit_inner_model(self, X, y, method="rf"):
+        if isinstance(X, pl.DataFrame):
+            X = X.to_pandas()
+        # prep = _build_preprocessor(target_type=self.target_type)
+        # prep.fit(X, y)
+        # X_enc = prep.transform(X)
+        if self.task == "regression":
+            if method == "rf":
+                self.inner_model = tabular_learner(RandomForestRegressor())
+        elif self.task == "classification":
+            self.inner_model = RandomForestClassifier()
+        else:
+            raise ValueError
+        self.inner_model.fit(X, y)
+        # self.inner_model.fit(X_enc, y)
+        return None
+        # return prep
+
+    def _predict_inner_model(self, X, preprocessor):
+        if isinstance(X, pl.DataFrame):
+            X = X.to_pandas()
+        # X_enc = preprocessor.transform(X)
+        X_enc = X
+        return self.inner_model.predict(X_enc)
 
     def _start_time(self, label: str):
         self.timestamps[label] = [dt.datetime.now(), None]
@@ -317,15 +539,35 @@ class BaseJoinEstimator(BaseEstimator):
             self.durations[k] += v
 
     def prepare_table(self, table):
-        if type(table) == pd.DataFrame:
+        if isinstance(table, pd.DataFrame):
             table = pl.from_pandas(table)
 
         table = table.fill_null(value="null").fill_nan(value=np.nan)
-        # table = ju.cast_features(table)
         return table.to_pandas()
 
+    def prepare_table_preprocessing(self, table):
+        """Prepare the given table applying a pre-processing step that fills
+        missing values and encodes categorical variables.
 
-class BaseJoinWithCandidatesMethod(BaseJoinEstimator):
+        Args:
+            table (pl.DataFrame, pd.DataFrame): Table to prepare
+
+        Returns:
+            pd.DataFrame: Prepared dataframe
+            list: List of categorical columns
+        """
+        cat_features = table.select(cs.string()).columns
+        # Storing the original column order
+        _columns = table.columns
+
+        # We should try new and more clever imputation methods
+        table = table.select(
+            cs.string().fill_null("null"), cs.numeric().fill_null("mean")
+        ).select(_columns)
+        return table.to_pandas(), cat_features
+
+
+class BaseJoinWithCandidatesMethod(BaseJoinSelector):
     """Base class that extends `BaseJoinMethod` to account for cases where multiple candidate joins are provided.
 
     Args:
@@ -351,35 +593,39 @@ class BaseJoinWithCandidatesMethod(BaseJoinEstimator):
 
     def _execute_joins(
         self, X_train, X_valid=None, cnd_table=None, left_on=None, right_on=None
-    ):
+    ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
+        # Execute the join on the main table
         merged_train = ju.execute_join_with_aggregation(
-            pl.from_pandas(X_train),
+            X_train,
             cnd_table,
             left_on=left_on,
             right_on=right_on,
             aggregation=self.join_parameters["aggregation"],
         )
 
+        # If a validation split is provided, join that separately
+        # Join separately to avoid aggr. leakage
         if X_valid is not None:
             merged_valid = ju.execute_join_with_aggregation(
-                pl.from_pandas(X_valid),
+                X_valid,
                 cnd_table,
                 left_on=left_on,
                 right_on=right_on,
                 aggregation=self.join_parameters["aggregation"],
             )
             return merged_train, merged_valid
-        else:
-            return merged_train
+
+        return merged_train
 
     def _evaluate_candidate(self, y_true, y_pred):
         if self.task == "regression":
             return r2_score(y_true, y_pred)
-        else:
-            return f1_score(y_true, y_pred)
+        return f1_score(y_true, y_pred)
 
 
-class NoJoin(BaseJoinEstimator):
+class NoJoin(BaseJoinSelector):
+    """Reference selector that just trains a model on the base table and predicts on it, with no joins."""
+
     def __init__(
         self,
         scenario_logger: ScenarioLogger = None,
@@ -391,31 +637,36 @@ class NoJoin(BaseJoinEstimator):
         self.name = "nojoin"
 
     def fit(
-        self, X=None, y=None, X_train=None, y_train=None, X_valid=None, y_valid=None
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        validation_set: tuple | None = None,
     ):
-        # TODO: ADD ERROR CHECKING HERE
+        if X.shape[0] != y.shape[0]:
+            raise ValueError
 
         if self.with_validation:
             self._start_time("prepare")
-            if X is not None and y is not None:
-                if X.shape[0] != y.shape[0]:
-                    raise ValueError
+
+            if validation_set is not None:
+                X_valid, y_valid = validation_set
+                X_train, y_train = X, y
+            else:
                 X_train, X_valid, y_train, y_valid = train_test_split(
                     X, y, test_size=0.2
                 )
+
             self.build_model(X_train)
 
             self.n_joined_columns = len(X_train.columns)
             self._end_time("prepare")
 
             self._start_time("model_train")
-            self.fit_model(X_train, y_train, X_valid, y_valid)
-            _end = dt.datetime.now()
+            self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
             self._end_time("model_train")
         else:
             self._start_time("prepare")
             self.build_model(X)
-            _end = dt.datetime.now()
             self.n_joined_columns = len(X.columns)
             self._end_time("prepare")
 
@@ -429,9 +680,6 @@ class NoJoin(BaseJoinEstimator):
         self._end_time("model_predict")
         return pred
 
-    def transform(self, X):
-        return X
-
     def get_additional_info(self):
         return {
             "best_candidate_hash": "nojoin",
@@ -444,11 +692,11 @@ class NoJoin(BaseJoinEstimator):
 class HighestContainmentJoin(BaseJoinWithCandidatesMethod):
     def __init__(
         self,
-        scenario_logger: ScenarioLogger = None,
-        candidate_joins: dict = None,
-        target_column: str = None,
-        model_parameters: dict = None,
-        join_parameters: dict = None,
+        scenario_logger: ScenarioLogger | None = None,
+        candidate_joins: dict | None = None,
+        target_column: str | None = None,
+        model_parameters: dict | None = None,
+        join_parameters: dict | None = None,
         task: str = "regression",
     ) -> None:
         super().__init__(
@@ -475,15 +723,19 @@ class HighestContainmentJoin(BaseJoinWithCandidatesMethod):
             "candidate"
         ].item()
 
-        mdata = self.candidate_joins[self.best_cnd_hash]
+        mdata = self.candidate_joins[self.best_cnd_hash]  # type: ignore
         _, best_cnd_md, self.left_on, self.right_on = mdata.get_join_information()
 
         self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
 
+        # Models with validation (i.e., not linear)
         if self.with_validation:
+            # Split in train and validation
             X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
+
             self._end_time("prepare")
             self._start_time("join_train")
+            # Execute join separately on each split (to avoid contamination with aggr)
             merged_train, merged_valid = self._execute_joins(
                 X_train=X_train,
                 X_valid=X_valid,
@@ -495,7 +747,11 @@ class HighestContainmentJoin(BaseJoinWithCandidatesMethod):
             self._end_time("join_train")
             self._start_time("model_train")
             self.build_model(merged_train)
-            self.fit_model(merged_train, y_train, merged_valid, y_valid)
+
+            # Fit the given model
+            self.fit_model(
+                merged_train, y_train, validation_set=(merged_valid, y_valid)
+            )
             self._end_time("model_train")
         else:
             self._end_time("prepare")
@@ -561,6 +817,7 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
         join_parameters: dict = None,
         task: str = "regression",
         valid_size: float = 0.2,
+        use_rf: bool = False,
     ) -> None:
         """
         Args:
@@ -580,7 +837,10 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
             join_parameters,
             task,
         )
+        self.use_rf = use_rf
         self.name = "best_single_join"
+        if use_rf:
+            self.name += "_rf"
         self.candidate_ranking = None
 
         self.best_cnd_hash = None
@@ -593,14 +853,12 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
     def get_best_candidates(self, top_k=None):
         if top_k is None:
             return self.candidate_ranking
-        else:
-            return self.candidate_ranking.limit(top_k)
+        return self.candidate_ranking.limit(top_k)
 
     def fit(self, X, y):
         self._start_time("prepare")
-        X_train, X_valid, y_train, y_valid = train_test_split(
-            X, y, test_size=self.valid_size
-        )
+        # Prepare splits
+        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
         self._end_time("prepare")
         ranking = []
 
@@ -611,6 +869,7 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
             desc="BestSingleJoin",
             position=2,
         ):
+            # Join on the candidate
             self._start_time("join_train")
             _, cnd_md, left_on, right_on = cjoin.get_join_information()
             cnd_table = pl.read_parquet(cnd_md["full_path"])
@@ -618,17 +877,28 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
             merged_train, merged_valid = self._execute_joins(
                 X_train, X_valid, cnd_table, left_on, right_on
             )
+
             self._end_time("join_train")
 
             self._start_time("model_train")
+            # Build the model
             self.build_model(merged_train)
-            self.fit_model(merged_train, y_train, merged_valid, y_valid)
 
-            y_pred = self.predict_model(merged_valid)
+            method = "rf"
+            if self.use_rf:
+                inner_model = self._prepare_inner_model()
+                y_pred = self._fit_predict_inner_model(
+                    merged_train, merged_valid, y_train, inner_model
+                )
+            else:
+                self.fit_model(
+                    merged_train, y_train, validation_set=(merged_valid, y_valid)
+                )
+                self._end_time("model_train")
+                self._start_time("prepare")
+                y_pred = self.predict_model(merged_valid)
             metric = self._evaluate_candidate(y_valid, y_pred)
-            self._end_time("model_train")
 
-            self._start_time("prepare")
             ranking.append({"candidate": hash_, "metric": metric})
 
             if metric > self.best_cnd_metric:
@@ -646,6 +916,7 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
             self.left_on,
             self.right_on,
         ) = best_join_mdata.get_join_information()
+
         self.best_cnd_table = pl.read_parquet(best_cnd_md["full_path"])
         self._end_time("prepare")
         self._start_time("join_train")
@@ -657,14 +928,15 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
 
         self._start_time("model_train")
         self.build_model(best_train)
-        self.fit_model(best_train, y_train, best_valid, y_valid)
+
+        self.fit_model(best_train, y_train, validation_set=(best_valid, y_valid))
         self.candidate_ranking = pl.from_dicts(ranking).sort("metric", descending=True)
         self._end_time("model_train")
 
     def predict(self, X):
         self._start_time("join_predict")
         merged_test = ju.execute_join_with_aggregation(
-            pl.from_pandas(X),
+            X,
             self.best_cnd_table,
             left_on=self.left_on,
             right_on=self.right_on,
@@ -678,9 +950,6 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
         self._end_time("model_predict")
 
         return pred
-
-    def transform(self, X):
-        pass
 
     def get_estimator_parameters(self):
         d = super().get_estimator_parameters()
@@ -699,7 +968,7 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
         self, X_train, X_valid=None, cnd_table=None, left_on=None, right_on=None
     ):
         merged_train = ju.execute_join_with_aggregation(
-            pl.from_pandas(X_train),
+            X_train,
             cnd_table,
             left_on=left_on,
             right_on=right_on,
@@ -708,7 +977,7 @@ class BestSingleJoin(BaseJoinWithCandidatesMethod):
 
         if X_valid is not None:
             merged_valid = ju.execute_join_with_aggregation(
-                pl.from_pandas(X_valid),
+                X_valid,
                 cnd_table,
                 left_on=left_on,
                 right_on=right_on,
@@ -732,6 +1001,7 @@ class FullJoin(BaseJoinWithCandidatesMethod):
         model_parameters: dict = None,
         join_parameters: dict = None,
         task: str = "regression",
+        top_k: None | int = None,
     ) -> None:
         super().__init__(
             scenario_logger,
@@ -741,20 +1011,29 @@ class FullJoin(BaseJoinWithCandidatesMethod):
             join_parameters,
             task,
         )
-        self.name = "full_join"
+        if top_k is None:
+            self.name = "full_join"
+        else:
+            if top_k < 1:
+                raise ValueError(f"k must be >= 1, found {top_k}.")
+            if not isinstance(top_k, int):
+                raise TypeError(f"top_k must be integer, found {type(top_k)}")
+            self.top_k = top_k
+            self.name = f"top_{top_k}_full_join"
+            self.candidate_joins = {
+                k: v
+                for k, v in self.candidate_joins.items()
+                if k in islice(self.candidate_joins, top_k)
+            }
+
         if self.join_parameters["aggregation"] == "dfs":
             print("Full join not available with DFS.")
             return None
 
-    def fit(
-        self, X=None, y=None, X_train=None, y_train=None, X_valid=None, y_valid=None
-    ):
+    def fit(self, X=None, y=None):
         if self.with_validation:
             self._start_time("prepare")
-            if X is not None and y is not None:
-                X_train, X_valid, y_train, y_valid = train_test_split(
-                    X, y, test_size=0.2
-                )
+            X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
             merged_train = pl.from_pandas(X_train).clone().lazy()
             self._end_time("prepare")
             self._start_time("join_train")
@@ -768,14 +1047,13 @@ class FullJoin(BaseJoinWithCandidatesMethod):
             self._end_time("join_train")
             self._start_time("model_train")
             self.build_model(merged_train)
-            self.fit_model(merged_train, y_train, merged_valid, y_valid)
+            self.fit_model(
+                merged_train, y_train, validation_set=(merged_valid, y_valid)
+            )
             self._end_time("model_train")
 
         else:
             self._start_time("prepare")
-            if X is None and y is None:
-                X = X_train
-                y = y_train
             merged_train = pl.from_pandas(X).clone().lazy()
             self._end_time("prepare")
             self._start_time("join_train")
@@ -803,9 +1081,6 @@ class FullJoin(BaseJoinWithCandidatesMethod):
 
         return pred
 
-    def transform(self, X):
-        pass
-
     def get_estimator_parameters(self):
         d = super().get_estimator_parameters()
         d.update(self.join_parameters)
@@ -818,61 +1093,6 @@ class FullJoin(BaseJoinWithCandidatesMethod):
             "left_on": "",
             "right_on": "",
             "n_joined_columns": self.n_joined_columns,
-        }
-
-
-class TopKFullJoin(FullJoin):
-    """
-    The `TopKFullJoin` selector extends the `FullJoin` selector adding a parameter `k` to limit the full
-    join to the first `k` candidates provided. The selector assumes that candidates are already
-    sorted: no further sorting is carried out.
-
-    This selector should be used for testing the ranking strategies employed by a retrieval method.
-
-    If `k=1` and `retrieval_method="exact_matching"`, this is equivalent to `HighestContainmentJoin`.
-
-    """
-
-    def __init__(
-        self,
-        scenario_logger: ScenarioLogger = None,
-        candidate_joins: dict = None,
-        target_column: str = None,
-        model_parameters: dict = None,
-        join_parameters: dict = None,
-        top_k: int = 1,
-        task: str = "regression",
-    ) -> None:
-        """
-        Args:
-            scenario_logger (ScenarioLogger, optional): The ScenarioLogger used to track information
-            about the experiments.
-            candidate_joins (dict, optional): The (already sorted) candidate joins.
-            target_column (str, optional): The target column to be used for training the supervised model. Defaults to None.
-            model_parameters (dict, optional): Additional parameters to be passed to the evaluation model (catboost or linear).
-            join_parameters (dict, optional): Additional parameters to be considered when executing the join.
-            top_k (int, optional): The number of candidates to be used during the full join. Defaults to 1.
-            task (str, optional): The task to be executed. Either "classification" or "regression". Defaults to "regression".
-
-        Raises:
-            ValueError: _description_
-        """
-        super().__init__(
-            scenario_logger,
-            candidate_joins,
-            target_column,
-            model_parameters,
-            join_parameters,
-            task,
-        )
-        if top_k < 1:
-            raise ValueError(f"k must be >= 1, found {top_k}.")
-        self.top_k = top_k
-        self.name = "top_k_full_join"
-        self.candidate_joins = {
-            k: v
-            for k, v in self.candidate_joins.items()
-            if k in islice(self.candidate_joins, top_k)
         }
 
 
@@ -893,6 +1113,7 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         valid_size: float = 0.2,
         max_candidates: int = 50,
         task: str = "regression",
+        use_rf: bool = False,
     ) -> None:
         super().__init__(
             scenario_logger,
@@ -904,6 +1125,9 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         )
 
         self.name = "stepwise_greedy_join"
+        self.use_rf = use_rf
+        if use_rf:
+            self.name += "_rf"
         self.budget_type, self.budget_amount = self._check_budget(
             budget_type, budget_amount
         )
@@ -925,20 +1149,22 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         self.base_epsilon = epsilon
         self.epsilon = epsilon
 
+        self.inner_model = None
+
         self.wrap_up_joiner = None
         self.wrap_up_joiner_params = model_parameters
 
     def fit(self, X: pd.DataFrame, y):
         self._start_time("prepare")
-        X_train, X_valid, y_train, y_valid = train_test_split(
-            X, y, test_size=self.valid_size
-        )
+        X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2)
 
         self.candidate_ranking = self._build_ranking(X)
-        # BASE TABLE
+        ########## BASE TABLE
         self._start_time("model_train")
         self.build_model(X_train)
-        self.fit_model(X_train, y_train, X_valid, y_valid)
+
+        # Fit the given model
+        self.fit_model(X_train, y_train, validation_set=(X_valid, y_valid))
         self._end_time("model_train")
         self._start_time("model_predict")
         y_pred = self.predict_model(X_valid)
@@ -950,8 +1176,7 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         self.current_X_train = X_train
         self.current_X_valid = X_valid
 
-        # TODO: rewrite this to account for different budget types
-        for iter_ in tqdm(
+        for _ in tqdm(
             range(self.budget_amount),
             total=self.budget_amount,
             desc="StepwiseGreedyJoin - Iterating: ",
@@ -978,15 +1203,27 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
                     right_on,
                     suffix=cjoin.candidate_id[:10],
                 )
+
                 self._end_time("join_train")
 
                 self._start_time("model_train")
                 self.build_model(temp_X_train)
-                self.fit_model(temp_X_train, y_train, temp_X_valid, y_valid)
-                self._end_time("model_train")
 
-                self._start_time("prepare")
-                y_pred = self.predict_model(temp_X_valid)
+                # Fit the given model
+                if self.use_rf:
+                    y_pred = self._prepare_inner_model(
+                        merged_train, y_train, merged_valid, method
+                    )
+                else:
+                    self.fit_model(
+                        temp_X_train,
+                        y_train,
+                        validation_set=(temp_X_valid, y_valid),
+                    )
+                    self._end_time("model_train")
+                    self._start_time("prepare")
+                    y_pred = self.predict_model(temp_X_valid)
+
                 metric = self._evaluate_candidate(y_valid, y_pred)
                 self._end_time("prepare")
             else:
@@ -999,6 +1236,7 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
             self._end_time("prepare")
 
         if len(self.selected_candidates) > 0:
+            # Full join all the selected candidates
             self._start_time("prepare")
             self.wrap_up_joiner = FullJoin(
                 scenario_logger=self.scenario_logger,
@@ -1009,14 +1247,10 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
                 task=self.task,
             )
             self._end_time("prepare")
-            self.wrap_up_joiner.fit(
-                X_train=X_train,
-                y_train=y_train,
-                X_valid=X_valid,
-                y_valid=y_valid,
-            )
+            self.wrap_up_joiner.fit(X=X, y=y)
 
         else:
+            # No good candidates found, train on the base table
             self._start_time("prepare")
             self.wrap_up_joiner = NoJoin(
                 scenario_logger=self.scenario_logger,
@@ -1025,15 +1259,7 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
                 task=self.task,
             )
             self._end_time("prepare")
-            if self.chosen_model == "catboost":
-                self.wrap_up_joiner.fit(
-                    X_train=X_train,
-                    y_train=y_train,
-                    X_valid=X_valid,
-                    y_valid=y_valid,
-                )
-            else:
-                self.wrap_up_joiner.fit(X, y)
+            self.wrap_up_joiner.fit(X=X, y=y)
 
         self.n_joined_columns = self.wrap_up_joiner.n_joined_columns
         self.update_durations(self.wrap_up_joiner.get_durations())
@@ -1054,7 +1280,6 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
         elif 0 < len(self.blacklist) < self.n_candidates:
             # If the length of the blacklist is == n_candidates, then all candidates have already been discarded, stopping
             # All candidates have been evaluated, selecting one of the discarded candidates
-            # TODO: add a more clever selection of discarded candidates
             random.shuffle(self.blacklist)
             _cnd = self.blacklist.popleft()
             return self.candidate_joins[_cnd]
@@ -1097,8 +1322,7 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
             raise ValueError(
                 f"`ranking_method` {ranking_method} not in SUPPORTED_RANKING_METHODS."
             )
-        else:
-            return ranking_method
+        return ranking_method
 
     def _check_budget(self, budget_type, budget_amount):
         if budget_type == "iterations":
@@ -1111,11 +1335,10 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
             if budget_amount <= 0:
                 raise ValueError("The number of iterations must be strictly positive.")
             return budget_type, budget_amount
-        # TODO: ADD MORE BUDGET TYPES LATER
-        else:
-            raise ValueError(
-                f"Provided budget_type {budget_type} not in SUPPORTED_BUDGET_TYPES."
-            )
+
+        raise ValueError(
+            f"Provided budget_type {budget_type} not in SUPPORTED_BUDGET_TYPES."
+        )
 
     def _execute_joins(
         self,
@@ -1163,7 +1386,3 @@ class StepwiseGreedyJoin(BaseJoinWithCandidatesMethod):
                 cjoin.candidate_id for cjoin in self.selected_candidates.values()
             ],
         }
-
-
-class OptimumGreedyJoin(BaseJoinEstimator):
-    pass

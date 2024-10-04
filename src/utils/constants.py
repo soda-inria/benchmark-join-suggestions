@@ -1,7 +1,11 @@
 """
-This script gathers all the constants that tare used across different scripts (mainly for plotting) to
-have consistent ordering and formatting of labels across the project.
+This script gathers all the constants that tare used across different scripts
+(mainly for plotting) to have consistent ordering and formatting of labels across
+the project.
 """
+
+# Supported models
+SUPPORTED_MODELS = ["linear", "catboost", "realmlp", "resnet"]
 
 # Grouping keys used to find the "difference from the mean"
 GROUPING_KEYS = [
@@ -168,7 +172,12 @@ LABEL_MAPPING = {
         "starmie": "Starmie",
         "minhash_hybrid": "H. MinHash",
     },
-    "chosen_model": {"catboost": "CatBoost", "linear": "Linear"},
+    "chosen_model": {
+        "catboost": "CatBoost",
+        "linear": "Linear",
+        "realmlp": "RealMLP",
+        "resnet": "ResNet",
+    },
     "estimator": {
         "full_join": "Full Join",
         "best_single_join": "Best Single Join",
@@ -185,7 +194,7 @@ LABEL_MAPPING = {
         "chosen_model": "ML model",
         "base_table": "Base table",
     },
-    "aggregation": {"first": "First", "mean": "Mean", "dfs": "DFS"},
+    "aggregation": {"first": "Any", "mean": "Mean", "dfs": "DFS"},
     "budget_amount": {10: 10, 30: 30, 100: 100},
     "target_dl": {
         "binary_update": "Binary",
